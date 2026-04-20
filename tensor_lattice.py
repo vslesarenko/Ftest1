@@ -234,6 +234,27 @@ def uniform_bond_weights_inplace(t: np.ndarray, value: float = 1.0) -> None:
     t[CH_TOP] = np.where(t[CH_TOP] > 0.0, v, 0.0)
 
 
+def randomize_bond_stiffness_inplace(
+    t: np.ndarray,
+    seed: int,
+    *,
+    low: float = 0.2,
+    high: float = 1.0,
+) -> None:
+    """
+    Multiply each positive half-edge weight by an independent U(low, high) factor
+    (then clip). Same material E at the element level; relative stiffness varies,
+    which redistributes internal forces and typically **raises peak beam stresses**
+    vs a uniform lattice at fixed δ.
+    """
+    rng = np.random.default_rng(seed)
+    lo = float(np.clip(low, 1e-6, 1.0))
+    hi = float(np.clip(high, lo, 1.0))
+    for ch in (CH_RIGHT, CH_TOP):
+        fac = rng.uniform(lo, hi, size=t[ch].shape)
+        t[ch] = np.where(t[ch] > 0.0, np.clip(t[ch] * fac, 0.0, 1.0), 0.0)
+
+
 @dataclass(frozen=True)
 class GlobalScalars:
     bond_fill: float

@@ -23,6 +23,7 @@ from tensor_lattice import (
     SolveConfig,
     fully_connected_gaussian_tensor,
     fully_connected_perturbed_tensor,
+    randomize_bond_stiffness_inplace,
     solve_tensor_mechanics,
 )
 
@@ -39,11 +40,23 @@ def _make_tensor(kind: PertKind, perturb: float, seed: int) -> np.ndarray:
     )
 
 
-def _run_single(job: tuple[PertKind, float, int, float]) -> dict[str, Any]:
+def _run_single(
+    job: tuple[PertKind, float, int, float, float, float | None],
+) -> dict[str, Any]:
     """Worker entry point (must be picklable for ProcessPoolExecutor)."""
-    kind, perturb, seed, e_scale = job
+    kind, perturb, seed, e_scale, delta, bond_hetero_low = job
     t = _make_tensor(kind, perturb, seed)
-    cfg = SolveConfig(bond_threshold=0.0, connect_all=False, e_scale=float(e_scale))
+    if bond_hetero_low is not None:
+        hseed = int((int(seed) * 1103515245 + 12345) % (2**31))
+        randomize_bond_stiffness_inplace(
+            t, hseed, low=float(bond_hetero_low), high=1.0
+        )
+    cfg = SolveConfig(
+        bond_threshold=0.0,
+        connect_all=False,
+        e_scale=float(e_scale),
+        delta=float(delta),
+    )
     ms = solve_tensor_mechanics(t, W_DEFAULT, H_DEFAULT, cfg)
     r: MechanicsResult = ms.result
     mm = float(r.strut_mass_metric) if r.ok else float("nan")
@@ -68,6 +81,10 @@ def _run_single(job: tuple[PertKind, float, int, float]) -> dict[str, Any]:
         "strut_mass_metric": mm,
         "strut_length_sum": float(r.strut_length_sum) if r.ok else float("nan"),
         "E_eff_over_mass": e_over_m,
+        "delta_applied": float(delta),
+        "bond_hetero_low": float(bond_hetero_low)
+        if bond_hetero_low is not None
+        else float("nan"),
     }
     return row
 
@@ -318,6 +335,18 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=48, help="Random realizations per level")
     ap.add_argument("--master-seed", type=int, default=0, help="Base seed for SeedSequence")
     ap.add_argument("--e-scale", type=float, default=10000.0, help="Young modulus scale (same as solve)")
+    ap.add_argument(
+        "--delta",
+        type=float,
+        default=0.01,
+        help="Prescribed u_x on right column; peak stresses scale ~linearly with δ at fixed E",
+    )
+    ap.add_argument(
+        "--bond-hetero-low",
+        type=float,
+        default=float("nan"),
+        help="If set (e.g. 0.15–0.35), scale each strut stiffness by U(low,1) for load concentration",
+    )
     ap.add_argument("--workers", type=int, default=0, help="Parallel workers (0 = CPU count)")
     ap.add_argument(
         "--out-dir",
@@ -339,11 +368,25 @@ def main() -> None:
 
     p_levels = np.linspace(0.0, float(args.p_max), int(args.levels))
     rng = np.random.default_rng(int(args.master_seed))
-    jobs: list[tuple[PertKind, float, int, float]] = []
+    hetero = (
+        None
+        if (args.bond_hetero_low is None or np.isnan(float(args.bond_hetero_low)))
+        else float(args.bond_hetero_low)
+    )
+    jobs: list[tuple[PertKind, float, int, float, float, float | None]] = []
     for p in p_levels:
         for _ in range(int(args.repeats)):
             seed = int(rng.integers(0, 2**31, endpoint=False))
-            jobs.append((args.kind, float(p), seed, float(args.e_scale)))
+            jobs.append(
+                (
+                    args.kind,
+                    float(p),
+                    seed,
+                    float(args.e_scale),
+                    float(args.delta),
+                    hetero,
+                )
+            )
 
     n_workers = int(args.workers) if args.workers > 0 else min(len(jobs), os.cpu_count() or 4)
 
