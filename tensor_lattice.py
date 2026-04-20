@@ -842,6 +842,7 @@ def visualize_tensor(
     title: str = "",
     globals_: GlobalScalars | None = None,
     note: str = "",
+    footer: str = "",
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -895,11 +896,22 @@ def visualize_tensor(
             f" | bonds μ={globals_.bond_fill:.3f}, rms_disp={globals_.rms_disp:.3f}, "
             f"|E|={globals_.n_edges}, d_min={globals_.min_node_distance:.3f}"
         )
-    fig.suptitle(ttl, fontsize=10)
-    fig.tight_layout()
+    fig.suptitle(ttl, fontsize=10, y=0.99)
+    fig.tight_layout(rect=[0, 0.07 if footer else 0.05, 1, 0.93])
+    if footer:
+        fig.text(
+            0.5,
+            0.012,
+            footer,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            family="monospace",
+            transform=fig.transFigure,
+        )
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -912,6 +924,7 @@ def visualize_mechanics(
     title: str = "",
     eff: dict[str, float] | None = None,
     stress_units: str = "model units",
+    footer: str = "",
 ) -> None:
     try:
         import matplotlib as mpl
@@ -952,11 +965,22 @@ def visualize_mechanics(
             f"K_sec={eff['K_sec']:.4g}  "
             f"σ_end={eff['sigma_macro_end']:.4g}  ε={eff['eps_macro']:.4g}"
         )
-    fig.suptitle(st2, fontsize=9)
-    fig.tight_layout()
+    fig.suptitle(st2, fontsize=9, y=0.99)
+    fig.tight_layout(rect=[0, 0.08 if footer else 0.04, 1, 0.92])
+    if footer:
+        fig.text(
+            0.5,
+            0.015,
+            footer,
+            ha="center",
+            va="bottom",
+            fontsize=7.5,
+            family="monospace",
+            transform=fig.transFigure,
+        )
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
