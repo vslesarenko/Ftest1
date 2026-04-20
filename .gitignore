@@ -7,3 +7,4 @@ venv/
 .env
 *.swp
 .DS_Store
+pic/ensemble_*/

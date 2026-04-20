@@ -65,6 +65,59 @@ CH_TOP = 3
 N_CH = 4
 
 
+@dataclass
+class SolveConfig:
+    """Mechanical solve parameters (defaults match `solve` CLI)."""
+
+    bond_threshold: float = 0.5
+    connect_all: bool = False
+    bond_floor: float = 1.0
+    uniform_bonds: bool = False
+    uniform_bond_value: float = 1.0
+    delta: float = 0.01
+    E: float = 1.0
+    A: float = 1.0
+    I: float = 1e-2
+    y_ext: float | None = None
+    e_scale: float = 10000.0
+
+
+@dataclass
+class MechanicsResult:
+    """Scalar outputs from one mechanics solve (serializable for CSV / analysis)."""
+
+    ok: bool
+    error: str = ""
+    E_eff: float = float("nan")
+    sigma_max: float = float("nan")
+    sigma_min: float = float("nan")
+    sigma_macro_end: float = float("nan")
+    eps_macro: float = float("nan")
+    K_sec: float = float("nan")
+    sum_rx_left: float = float("nan")
+    mean_ux_left: float = float("nan")
+    mean_ux_right: float = float("nan")
+    strain_like_mean: float = float("nan")
+    rms_disp: float = float("nan")
+    bond_fill: float = float("nan")
+    n_edges_full: int = 0
+    n_nodes_reduced: int = 0
+    n_edges_reduced: int = 0
+    min_node_distance: float = float("nan")
+
+
+@dataclass
+class MechanicsSolve:
+    """Full solve bundle: metrics plus optional arrays for plotting."""
+
+    result: MechanicsResult
+    frame: FrameResult | None = None
+    sigma: np.ndarray | None = None
+    xy: np.ndarray | None = None
+    edges: list[tuple[int, int]] | None = None
+    connect_bridge: tuple[int, int] | None = None
+
+
 def node_id(i: int, j: int, w: int) -> int:
     return j * w + i
 
@@ -98,6 +151,34 @@ def fully_connected_perturbed_tensor(
     t[CH_TOP] = 1.0
     t[CH_RIGHT][:, -1] = 0.0
     t[CH_TOP][-1, :] = 0.0
+    return t
+
+
+def fully_connected_gaussian_tensor(
+    w: int = W_DEFAULT,
+    h: int = H_DEFAULT,
+    *,
+    perturb: float = 1.0,
+    seed: int = 0,
+) -> np.ndarray:
+    """
+    Full bond grid; dx, dy are i.i.d. Gaussian with std proportional to ``perturb``.
+    Uses σ_x = perturb * (DX_MAX/3), σ_y = perturb * (DY_MAX/3) before clipping so
+    typical magnitudes are comparable to the uniform ``fully_connected_perturbed_tensor``.
+    ``perturb=0`` yields zero offsets (deterministic ideal lattice).
+    """
+    rng = np.random.default_rng(seed)
+    p = max(0.0, float(perturb))
+    sx = p * (DX_MAX / 3.0)
+    sy = p * (DY_MAX / 3.0)
+    t = empty_tensor(w, h)
+    t[CH_DX] = rng.normal(0.0, sx, size=(h, w))
+    t[CH_DY] = rng.normal(0.0, sy, size=(h, w))
+    t[CH_RIGHT] = 1.0
+    t[CH_TOP] = 1.0
+    t[CH_RIGHT][:, -1] = 0.0
+    t[CH_TOP][-1, :] = 0.0
+    clip_tensor_inplace(t)
     return t
 
 
@@ -822,6 +903,114 @@ def _resolve_pic_path(script_dir: Path, pic_dir: Path, path_str: str, default_na
     return pic_dir / p
 
 
+def solve_tensor_mechanics(
+    t: np.ndarray,
+    w: int,
+    h: int,
+    cfg: SolveConfig | None = None,
+) -> MechanicsSolve:
+    """
+    Run the same pipeline as CLI ``solve``: mask bonds, optional connect-all / uniform
+    weights, reduce to left-reachable component, assemble and return homogenized metrics.
+    """
+    cfg = cfg if cfg is not None else SolveConfig()
+    y_ext = cfg.y_ext if cfg.y_ext is not None else float(np.sqrt(cfg.I / max(cfg.A, 1e-30)))
+    t = np.asarray(t, dtype=np.float64, copy=True)
+    bridge: tuple[int, int] | None = None
+
+    try:
+        clip_tensor_inplace(t)
+        mask_bonds_by_threshold_inplace(t, float(cfg.bond_threshold))
+
+        if cfg.connect_all:
+            ag, al = connect_tensor_full(t, w, h, bond_floor=cfg.bond_floor)
+            bridge = (ag, al)
+
+        if cfg.uniform_bonds:
+            ub = float(np.clip(cfg.uniform_bond_value, 0.0, 1.0))
+            uniform_bond_weights_inplace(t, ub)
+
+        xy, edges, weights = tensor_to_geometry(t, w=w, h=h, bond_threshold=1e-12)
+        if len(edges) < 3:
+            return MechanicsSolve(
+                result=MechanicsResult(ok=False, error="Too few edges to form a frame."),
+                connect_bridge=bridge,
+            )
+        if not all_right_reachable_from_left(edges, w, h):
+            return MechanicsSolve(
+                result=MechanicsResult(
+                    ok=False,
+                    error="Right face not fully connected to the left through bonds.",
+                ),
+                connect_bridge=bridge,
+            )
+
+        gl = compute_global_scalars(t, xy, edges, w, h)
+        xy_r, edges_r, weights_r, left, right = reduce_to_reachable_component(
+            xy, edges, weights, w, h
+        )
+
+        E_use = float(cfg.E) * float(cfg.e_scale)
+        ea = E_use * cfg.A
+        ei = E_use * cfg.I
+
+        res = assemble_and_solve_weighted(
+            xy_r,
+            edges_r,
+            weights_r,
+            ea,
+            ei,
+            left_nodes=left,
+            right_nodes=right,
+            delta_x=cfg.delta,
+        )
+
+        ea_edge = [ea * wgt for wgt in weights_r]
+        ei_edge = [ei * wgt for wgt in weights_r]
+        sigma = beam_fiber_stress_per_edge(
+            res.u, xy_r, edges_r, ea_edge, ei_edge, cfg.A, cfg.I, y_ext
+        )
+        span = float((w - 1) * STEP)
+        height_span = float((h - 1) * STEP)
+        eff = effective_young_modulus_homogenized(
+            res, left, span_x=span, height_y=height_span, delta_x=cfg.delta
+        )
+        ext = effective_extension_metrics(res, left, right, span, cfg.delta)
+
+        mr = MechanicsResult(
+            ok=True,
+            E_eff=float(eff["E_eff"]),
+            sigma_max=float(np.max(sigma)),
+            sigma_min=float(np.min(sigma)),
+            sigma_macro_end=float(eff["sigma_macro_end"]),
+            eps_macro=float(eff["eps_macro"]),
+            K_sec=float(eff["K_sec"]),
+            sum_rx_left=float(eff["sum_Rx_left"]),
+            mean_ux_left=float(ext["mean_ux_left"]),
+            mean_ux_right=float(ext["mean_ux_right"]),
+            strain_like_mean=float(ext["strain_like_mean"]),
+            rms_disp=gl.rms_disp,
+            bond_fill=gl.bond_fill,
+            n_edges_full=len(edges),
+            n_nodes_reduced=int(xy_r.shape[0]),
+            n_edges_reduced=len(edges_r),
+            min_node_distance=gl.min_node_distance,
+        )
+        return MechanicsSolve(
+            result=mr,
+            frame=res,
+            sigma=sigma,
+            xy=xy_r,
+            edges=edges_r,
+            connect_bridge=bridge,
+        )
+    except (ValueError, np.linalg.LinAlgError) as e:
+        return MechanicsSolve(
+            result=MechanicsResult(ok=False, error=str(e)),
+            connect_bridge=bridge,
+        )
+
+
 def cmd_random(args: argparse.Namespace) -> None:
     script_dir = Path(__file__).resolve().parent
     pic_dir = script_dir / "pic"
@@ -893,79 +1082,74 @@ def cmd_solve(args: argparse.Namespace) -> None:
     w = int(data.get("w", t.shape[2]))
     h = int(data.get("h", t.shape[1]))
 
-    clip_tensor_inplace(t)
-    mask_bonds_by_threshold_inplace(t, float(args.bond_threshold))
+    cfg = SolveConfig(
+        bond_threshold=float(args.bond_threshold),
+        connect_all=bool(args.connect_all),
+        bond_floor=float(args.bond_floor),
+        uniform_bonds=bool(getattr(args, "uniform_bonds", False)),
+        uniform_bond_value=float(getattr(args, "uniform_bond_value", 1.0)),
+        delta=float(args.delta),
+        E=float(args.E),
+        A=float(args.A),
+        I=float(args.I),
+        y_ext=float(args.y_ext),
+        e_scale=float(args.e_scale),
+    )
+    ms = solve_tensor_mechanics(t, w, h, cfg)
+    r = ms.result
 
-    if args.connect_all:
-        ag, al = connect_tensor_full(t, w, h, bond_floor=args.bond_floor)
+    if ms.connect_bridge is not None:
+        ag, al = ms.connect_bridge
         print(f"connect-all: +{ag} half-edges (merge components), +{al} (left reach)")
-
     if getattr(args, "uniform_bonds", False):
         ub = float(np.clip(args.uniform_bond_value, 0.0, 1.0))
-        uniform_bond_weights_inplace(t, ub)
         print(f"uniform bonds: all active half-edges → {ub:.4g}")
 
-    xy, edges, weights = tensor_to_geometry(t, w=w, h=h, bond_threshold=1e-12)
-    if len(edges) < 3:
-        raise SystemExit("Too few edges to form a frame — loosen bond threshold or edit tensor.")
-    if not all_right_reachable_from_left(edges, w, h):
-        raise SystemExit(
-            "Some right-face nodes are not connected to the left through bonds — "
-            "regenerate, lower --bond-threshold, use --connect-all, or denser bonds."
-        )
+    if not r.ok:
+        raise SystemExit(r.error or "Mechanics solve failed.")
 
-    try:
-        xy, edges, weights, left, right = reduce_to_reachable_component(
-            xy, edges, weights, w, h
-        )
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
-    print(f"Reduced model: {xy.shape[0]} nodes, {len(edges)} edges (reachable from left)")
-
+    print(
+        f"Reduced model: {r.n_nodes_reduced} nodes, {r.n_edges_reduced} edges "
+        f"(reachable from left)"
+    )
     E_use = float(args.E) * float(args.e_scale)
-    ea = E_use * args.A
-    ei = E_use * args.I
-
-    res = assemble_and_solve_weighted(
-        xy,
-        edges,
-        weights,
-        ea,
-        ei,
-        left_nodes=left,
-        right_nodes=right,
-        delta_x=args.delta,
-    )
-
-    ea_edge = [ea * wgt for wgt in weights]
-    ei_edge = [ei * wgt for wgt in weights]
-    sigma = beam_fiber_stress_per_edge(
-        res.u, xy, edges, ea_edge, ei_edge, args.A, args.I, args.y_ext
-    )
-    span = float((w - 1) * STEP)
-    height_span = float((h - 1) * STEP)
-    metrics = effective_extension_metrics(res, left, right, span, args.delta)
-    eff = effective_young_modulus_homogenized(
-        res, left, span_x=span, height_y=height_span, delta_x=args.delta
-    )
-    print(f"max stress est: {float(np.max(sigma)):.6g} (same units as E)")
-    print(f"E_eff (homogenized): {eff['E_eff']:.6g}")
+    print(f"max stress est: {r.sigma_max:.6g} (same units as E)")
+    print(f"E_eff (homogenized): {r.E_eff:.6g}")
+    metrics = {
+        "mean_ux_left": r.mean_ux_left,
+        "mean_ux_right": r.mean_ux_right,
+        "delta_applied": float(args.delta),
+        "strain_like_mean": r.strain_like_mean,
+    }
+    effective = {
+        "E_eff": r.E_eff,
+        "sigma_macro_end": r.sigma_macro_end,
+        "eps_macro": r.eps_macro,
+        "K_sec": r.K_sec,
+        "sum_Rx_left": r.sum_rx_left,
+    }
     print(f"metrics: {metrics}")
-    print(f"effective: {eff}")
+    print(f"effective: {effective}")
 
     stress_label = "scaled" if args.e_scale != 1.0 else "model units"
     if not args.no_plot:
         outp = _resolve_pic_path(script_dir, pic_dir, args.plot, "tensor_lattice_solve.png")
         note_p = f"{args.note} | " if getattr(args, "note", "") else ""
+        eff_dict = {
+            "E_eff": r.E_eff,
+            "sigma_macro_end": r.sigma_macro_end,
+            "eps_macro": r.eps_macro,
+            "K_sec": r.K_sec,
+        }
         visualize_mechanics(
-            res,
-            sigma,
+            ms.frame,
+            ms.sigma,
             outp,
             disp_scale=args.plot_scale,
             title=(
                 f"{note_p}E_base={args.E}, e_scale={args.e_scale}, E_use={E_use:.4g}, δ={args.delta}"
             ),
-            eff=eff,
+            eff=eff_dict,
             stress_units=stress_label,
         )
         print(f"Saved mechanics figure to {outp}")
