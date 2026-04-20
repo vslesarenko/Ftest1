@@ -21,13 +21,21 @@ from tensor_lattice import (
     W_DEFAULT,
     MechanicsResult,
     SolveConfig,
+    compute_global_scalars,
     fully_connected_gaussian_tensor,
     fully_connected_perturbed_tensor,
+    partial_grid_uniform_beams,
     randomize_bond_stiffness_inplace,
     solve_tensor_mechanics,
+    tensor_to_geometry,
+    visualize_tensor,
 )
 
-PertKind = Literal["gaussian", "uniform"]
+PertKind = Literal["gaussian", "uniform", "sparse"]
+
+
+def _is_ok_row(row: dict[str, Any]) -> bool:
+    return row.get("ok") in (True, "True", "true", 1, "1")
 
 
 def _make_tensor(kind: PertKind, perturb: float, seed: int) -> np.ndarray:
@@ -35,22 +43,34 @@ def _make_tensor(kind: PertKind, perturb: float, seed: int) -> np.ndarray:
         return fully_connected_gaussian_tensor(
             W_DEFAULT, H_DEFAULT, perturb=float(perturb), seed=int(seed)
         )
-    return fully_connected_perturbed_tensor(
-        W_DEFAULT, H_DEFAULT, perturb=float(perturb), seed=int(seed)
-    )
+    if kind == "uniform":
+        return fully_connected_perturbed_tensor(
+            W_DEFAULT, H_DEFAULT, perturb=float(perturb), seed=int(seed)
+        )
+    raise ValueError(f"_make_tensor: use partial_grid for kind={kind!r}")
 
 
 def _run_single(
-    job: tuple[PertKind, float, int, float, float, float | None],
+    job: tuple[PertKind, float, int, float, float, float | None, float],
 ) -> dict[str, Any]:
     """Worker entry point (must be picklable for ProcessPoolExecutor)."""
-    kind, perturb, seed, e_scale, delta, bond_hetero_low = job
-    t = _make_tensor(kind, perturb, seed)
-    if bond_hetero_low is not None:
-        hseed = int((int(seed) * 1103515245 + 12345) % (2**31))
-        randomize_bond_stiffness_inplace(
-            t, hseed, low=float(bond_hetero_low), high=1.0
+    kind, perturb, seed, e_scale, delta, bond_hetero_low, geom_scale = job
+    if kind == "sparse":
+        gs = float(geom_scale) if np.isfinite(geom_scale) else 0.8
+        t = partial_grid_uniform_beams(
+            W_DEFAULT,
+            H_DEFAULT,
+            geom_scale=gs,
+            bond_threshold=float(perturb),
+            seed=int(seed),
         )
+    else:
+        t = _make_tensor(kind, perturb, seed)
+        if bond_hetero_low is not None:
+            hseed = int((int(seed) * 1103515245 + 12345) % (2**31))
+            randomize_bond_stiffness_inplace(
+                t, hseed, low=float(bond_hetero_low), high=1.0
+            )
     cfg = SolveConfig(
         bond_threshold=0.0,
         connect_all=False,
@@ -85,8 +105,102 @@ def _run_single(
         "bond_hetero_low": float(bond_hetero_low)
         if bond_hetero_low is not None
         else float("nan"),
+        "geom_scale": float(geom_scale)
+        if kind == "sparse" and np.isfinite(geom_scale)
+        else float("nan"),
     }
     return row
+
+
+def _tensor_from_result_row(
+    row: dict[str, Any], *, geom_scale_fallback: float
+) -> np.ndarray:
+    """Rebuild lattice tensor from a CSV row (for figures only)."""
+    kind = str(row["kind"])
+    p = float(row["perturb"])
+    seed = int(row["seed"])
+    g_raw = row.get("geom_scale", "")
+    try:
+        gs = float(g_raw)
+    except (TypeError, ValueError):
+        gs = float("nan")
+    if not np.isfinite(gs):
+        gs = geom_scale_fallback
+    if kind == "sparse":
+        return partial_grid_uniform_beams(
+            W_DEFAULT,
+            H_DEFAULT,
+            geom_scale=gs,
+            bond_threshold=p,
+            seed=seed,
+        )
+    if kind == "gaussian":
+        t = fully_connected_gaussian_tensor(
+            W_DEFAULT, H_DEFAULT, perturb=p, seed=seed
+        )
+    else:
+        t = fully_connected_perturbed_tensor(
+            W_DEFAULT, H_DEFAULT, perturb=p, seed=seed
+        )
+    bh = row.get("bond_hetero_low", "")
+    try:
+        hlo = float(bh)
+    except (TypeError, ValueError):
+        hlo = float("nan")
+    if np.isfinite(hlo):
+        hseed = int((seed * 1103515245 + 12345) % (2**31))
+        randomize_bond_stiffness_inplace(t, hseed, low=hlo, high=1.0)
+    return t
+
+
+def export_examples_folder(
+    out_dir: Path,
+    rows: list[dict[str, Any]],
+    *,
+    max_examples: int,
+    geom_scale_fallback: float,
+    bond_threshold_display: float = 0.5,
+) -> None:
+    """Save ``examples/`` with tensor PNG + npz for stratified successful runs."""
+    ok_rows = [r for r in rows if _is_ok_row(r)]
+    if not ok_rows or max_examples <= 0:
+        return
+    ex = out_dir / "examples"
+    ex.mkdir(parents=True, exist_ok=True)
+
+    by_p: dict[float, list[dict[str, Any]]] = {}
+    for r in ok_rows:
+        by_p.setdefault(float(r["perturb"]), []).append(r)
+    for k in by_p:
+        by_p[k].sort(key=lambda x: int(x["seed"]))
+    levels = sorted(by_p.keys())
+    nlev = max(len(levels), 1)
+    per = max(1, max_examples // nlev)
+
+    chosen: list[dict[str, Any]] = []
+    for lev in levels:
+        chosen.extend(by_p[lev][:per])
+    if len(chosen) < max_examples:
+        rest = [r for r in ok_rows if r not in chosen]
+        chosen.extend(rest[: max_examples - len(chosen)])
+    chosen = chosen[:max_examples]
+
+    for i, row in enumerate(chosen):
+        t = _tensor_from_result_row(row, geom_scale_fallback=geom_scale_fallback)
+        xy, edges, _ = tensor_to_geometry(
+            t, w=W_DEFAULT, h=H_DEFAULT, bond_threshold=bond_threshold_display
+        )
+        gl = compute_global_scalars(t, xy, edges, W_DEFAULT, H_DEFAULT)
+        tag = f"ex_{i:02d}_k{row['kind']}_p{float(row['perturb']):.4f}_s{int(row['seed'])}"
+        np.savez_compressed(ex / f"{tag}.npz", tensor=t, w=W_DEFAULT, h=H_DEFAULT)
+        note = f"{tag} | uniform w on active bonds where applicable"
+        outp = ex / f"{tag}.png"
+        visualize_tensor(t, outp, globals_=gl, note=note)
+
+    (ex / "README.txt").write_text(
+        "Stratified snapshots (tensor channels + geometry). "
+        "Bond overlay uses display threshold 0.5; mechanics uses all w>0.\n"
+    )
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -104,7 +218,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> tuple[np.ndarray, dict[float, dict
     """Group by perturb level; return sorted levels and stats per level (ok rows only)."""
     by_p: dict[float, list[dict[str, Any]]] = {}
     for row in rows:
-        if not row.get("ok"):
+        if not _is_ok_row(row):
             continue
         p = float(row["perturb"])
         by_p.setdefault(p, []).append(row)
@@ -143,7 +257,7 @@ def _matrix_sorted_by_column(
     """
     by_p: dict[float, list[float]] = {}
     for row in rows:
-        if not row.get("ok"):
+        if not _is_ok_row(row):
             continue
         p = float(row["perturb"])
         by_p.setdefault(p, []).append(float(row[field]))
@@ -237,7 +351,7 @@ def _plot_hexbin_phase(
     s_arr: list[float] = []
     m_arr: list[float] = []
     for row in rows:
-        if not row.get("ok"):
+        if not _is_ok_row(row):
             continue
         p_arr.append(float(row["perturb"]))
         e_arr.append(float(row["E_eff"]))
@@ -284,6 +398,8 @@ def _plot_summary(
     stats: dict[float, dict[str, np.ndarray]],
     out_png: Path,
     title: str,
+    *,
+    x_label: str = "perturbation level p",
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -312,7 +428,7 @@ def _plot_summary(
     ax2.grid(True, alpha=0.3)
 
     ax3.errorbar(levels, Rom, yerr=Ros, fmt="D-", capsize=3, color="purple", markersize=4)
-    ax3.set_xlabel("perturbation level p")
+    ax3.set_xlabel(x_label)
     ax3.set_ylabel("E_eff / Σ(L·w)\n(stiffness per mass proxy)")
     ax3.grid(True, alpha=0.3)
 
@@ -326,12 +442,30 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Ensemble lattice study vs perturbation level")
     ap.add_argument(
         "--kind",
-        choices=("gaussian", "uniform"),
+        choices=("gaussian", "uniform", "sparse"),
         default="gaussian",
-        help="Gaussian: N(0,(p·DX/3)²) offsets; uniform: p scales U(-DX_MAX,DX_MAX) (same as --full-grid)",
+        help="gaussian/uniform: full grid; sparse: partial connectivity, τ on soft bonds, uniform w=1 active",
     )
     ap.add_argument("--levels", type=int, default=16, help="Number of p values from 0 to --p-max")
-    ap.add_argument("--p-max", type=float, default=1.0, help="Maximum perturbation level")
+    ap.add_argument("--p-max", type=float, default=1.0, help="Maximum perturbation level (ignored for sparse)")
+    ap.add_argument(
+        "--tau-min",
+        type=float,
+        default=0.14,
+        help="sparse kind: min bond threshold τ (avoid full grid)",
+    )
+    ap.add_argument(
+        "--tau-max",
+        type=float,
+        default=0.38,
+        help="sparse kind: max τ (avoid overly loose lattices)",
+    )
+    ap.add_argument(
+        "--geom-scale",
+        type=float,
+        default=0.82,
+        help="sparse kind: geometry disorder amplitude for node offsets",
+    )
     ap.add_argument("--repeats", type=int, default=48, help="Random realizations per level")
     ap.add_argument("--master-seed", type=int, default=0, help="Base seed for SeedSequence")
     ap.add_argument("--e-scale", type=float, default=10000.0, help="Young modulus scale (same as solve)")
@@ -359,6 +493,12 @@ def main() -> None:
         action="store_true",
         help="Skip heatmap and hexbin figures",
     )
+    ap.add_argument(
+        "--examples",
+        type=int,
+        default=0,
+        help="If >0, save this many stratified tensor PNG+npz under examples/",
+    )
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -366,14 +506,21 @@ def main() -> None:
     out_dir = Path(args.out_dir) if args.out_dir else script_dir / "pic" / f"ensemble_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    p_levels = np.linspace(0.0, float(args.p_max), int(args.levels))
+    if args.kind == "sparse":
+        p_levels = np.linspace(float(args.tau_min), float(args.tau_max), int(args.levels))
+    else:
+        p_levels = np.linspace(0.0, float(args.p_max), int(args.levels))
     rng = np.random.default_rng(int(args.master_seed))
     hetero = (
         None
         if (args.bond_hetero_low is None or np.isnan(float(args.bond_hetero_low)))
         else float(args.bond_hetero_low)
     )
-    jobs: list[tuple[PertKind, float, int, float, float, float | None]] = []
+    if args.kind == "sparse":
+        hetero = None
+    geom_scale_job = float(args.geom_scale) if args.kind == "sparse" else float("nan")
+
+    jobs: list[tuple[PertKind, float, int, float, float, float | None, float]] = []
     for p in p_levels:
         for _ in range(int(args.repeats)):
             seed = int(rng.integers(0, 2**31, endpoint=False))
@@ -385,6 +532,7 @@ def main() -> None:
                     float(args.e_scale),
                     float(args.delta),
                     hetero,
+                    geom_scale_job,
                 )
             )
 
@@ -403,7 +551,7 @@ def main() -> None:
     csv_path = out_dir / "ensemble_results.csv"
     _write_csv(csv_path, sorted(rows, key=lambda r: (r["perturb"], r["seed"])))
 
-    ok_n = sum(1 for r in rows if r.get("ok"))
+    ok_n = sum(1 for r in rows if _is_ok_row(r))
     readme = out_dir / "README.txt"
     extra = ""
     if not args.no_2d_maps:
@@ -411,8 +559,12 @@ def main() -> None:
             "figures: ensemble_Eeff_sigma.png  ensemble_map_2d_Eeff_sigma.png  "
             "ensemble_hexbin_phase.png  (heatmaps: E_eff, σ_max, mass; hexbins include p–mass and mass–E_eff)\n"
         )
+    sparse_line = ""
+    if args.kind == "sparse":
+        sparse_line = f"tau_min={args.tau_min}  tau_max={args.tau_max}  geom_scale={args.geom_scale}\n"
     readme.write_text(
         f"kind={args.kind}  levels={args.levels}  p_max={args.p_max}  repeats={args.repeats}\n"
+        f"{sparse_line}"
         f"master_seed={args.master_seed}  e_scale={args.e_scale}  workers={n_workers}\n"
         f"total jobs={len(rows)}  ok={ok_n}  failed={len(rows) - ok_n}\n"
         f"csv: {csv_path.name}\n"
@@ -424,10 +576,30 @@ def main() -> None:
         print("No successful runs — check CSV for errors.")
         return
 
-    title = f"Full grid, {args.kind} perturbation — mean±std over {args.repeats} runs/level"
-    _plot_summary(levels, stats, out_dir / "ensemble_Eeff_sigma.png", title)
+    x_label = (
+        "bond threshold τ (mask on soft bonds; then w=1 on survivors)"
+        if args.kind == "sparse"
+        else "perturbation level p"
+    )
+    title = f"{args.kind} lattice — mean±std over {args.repeats} runs/level"
+    _plot_summary(
+        levels,
+        stats,
+        out_dir / "ensemble_Eeff_sigma.png",
+        title,
+        x_label=x_label,
+    )
     print(f"Wrote {csv_path}")
     print(f"Wrote {out_dir / 'ensemble_Eeff_sigma.png'}")
+
+    if int(args.examples) > 0:
+        export_examples_folder(
+            out_dir,
+            rows,
+            max_examples=int(args.examples),
+            geom_scale_fallback=float(args.geom_scale),
+        )
+        print(f"Wrote {out_dir / 'examples'} (up to {int(args.examples)} snapshots)")
 
     if not args.no_2d_maps:
         z_E = _matrix_sorted_by_column(rows, levels, int(args.repeats), "E_eff")

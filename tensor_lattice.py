@@ -234,6 +234,38 @@ def uniform_bond_weights_inplace(t: np.ndarray, value: float = 1.0) -> None:
     t[CH_TOP] = np.where(t[CH_TOP] > 0.0, v, 0.0)
 
 
+def partial_grid_uniform_beams(
+    w: int = W_DEFAULT,
+    h: int = H_DEFAULT,
+    *,
+    geom_scale: float = 0.8,
+    bond_threshold: float = 0.32,
+    seed: int = 0,
+) -> np.ndarray:
+    """
+    Lattice that is **not** fully connected: random soft bonds are drawn, then bonds
+    with value ≤ ``bond_threshold`` are removed, then **all surviving half-edges are
+    set to weight 1** (uniform EA/EI / “same thickness” on active struts).
+
+    ``geom_scale`` in [0, 1] scales random node offsets. Use moderate ``bond_threshold``
+    (~0.15–0.40 on soft bonds in [0.2, 1]) to avoid trivial full grids and avoid
+    excessive pruning.
+    """
+    rng = np.random.default_rng(seed)
+    gs = float(np.clip(geom_scale, 0.0, 1.0))
+    t = empty_tensor(w, h)
+    t[CH_DX] = gs * rng.uniform(-DX_MAX, DX_MAX, size=(h, w))
+    t[CH_DY] = gs * rng.uniform(-DY_MAX, DY_MAX, size=(h, w))
+    t[CH_RIGHT] = rng.uniform(0.2, 1.0, size=(h, w))
+    t[CH_TOP] = rng.uniform(0.2, 1.0, size=(h, w))
+    t[CH_RIGHT][:, -1] = 0.0
+    t[CH_TOP][-1, :] = 0.0
+    clip_tensor_inplace(t)
+    mask_bonds_by_threshold_inplace(t, float(bond_threshold))
+    uniform_bond_weights_inplace(t, 1.0)
+    return t
+
+
 def randomize_bond_stiffness_inplace(
     t: np.ndarray,
     seed: int,
