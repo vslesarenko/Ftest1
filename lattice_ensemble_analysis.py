@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Ensemble study: full-grid lattices with Gaussian (or uniform) geometric perturbation.
-Runs many realizations, logs CSV, plots mean ± std of E_eff and σ_max vs perturbation level.
+Runs many realizations, logs CSV, and plots E_eff, σ_max, strut mass Σ(L·w), and stiffness/mass vs perturbation level.
 Uses ``tensor_lattice`` as a library with optional parallel workers.
 """
 from __future__ import annotations
@@ -46,6 +46,12 @@ def _run_single(job: tuple[PertKind, float, int, float]) -> dict[str, Any]:
     cfg = SolveConfig(bond_threshold=0.0, connect_all=False, e_scale=float(e_scale))
     ms = solve_tensor_mechanics(t, W_DEFAULT, H_DEFAULT, cfg)
     r: MechanicsResult = ms.result
+    mm = float(r.strut_mass_metric) if r.ok else float("nan")
+    e_over_m = (
+        float(r.E_eff) / mm
+        if r.ok and mm > 1e-30 and np.isfinite(mm)
+        else float("nan")
+    )
     row: dict[str, Any] = {
         "perturb": float(perturb),
         "seed": int(seed),
@@ -59,6 +65,9 @@ def _run_single(job: tuple[PertKind, float, int, float]) -> dict[str, Any]:
         "rms_disp": r.rms_disp,
         "n_edges_reduced": r.n_edges_reduced,
         "min_node_distance": r.min_node_distance,
+        "strut_mass_metric": mm,
+        "strut_length_sum": float(r.strut_length_sum) if r.ok else float("nan"),
+        "E_eff_over_mass": e_over_m,
     }
     return row
 
@@ -88,11 +97,17 @@ def _aggregate(rows: list[dict[str, Any]]) -> tuple[np.ndarray, dict[float, dict
         sub = by_p[float(p)]
         e = np.array([x["E_eff"] for x in sub], dtype=float)
         s = np.array([x["sigma_max"] for x in sub], dtype=float)
+        m = np.array([x["strut_mass_metric"] for x in sub], dtype=float)
+        eom = np.array([x["E_eff_over_mass"] for x in sub], dtype=float)
         stats[float(p)] = {
             "E_mean": np.mean(e),
             "E_std": np.std(e, ddof=1) if len(e) > 1 else 0.0,
             "sigma_mean": np.mean(s),
             "sigma_std": np.std(s, ddof=1) if len(s) > 1 else 0.0,
+            "mass_mean": np.mean(m),
+            "mass_std": np.std(m, ddof=1) if len(m) > 1 else 0.0,
+            "E_over_mass_mean": float(np.nanmean(eom)),
+            "E_over_mass_std": float(np.nanstd(eom, ddof=1)) if np.sum(np.isfinite(eom)) > 1 else 0.0,
             "n": len(sub),
         }
     return levels, stats
@@ -128,6 +143,7 @@ def _plot_heatmap_maps(
     levels: np.ndarray,
     z_E: np.ndarray,
     z_S: np.ndarray,
+    z_M: np.ndarray,
     out_png: Path,
     title: str,
 ) -> None:
@@ -147,7 +163,7 @@ def _plot_heatmap_maps(
         float(n_r) - 0.5,
     ]
 
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 5.2), sharey=True)
+    fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(16, 5.0), sharey=True)
     m0 = ax0.imshow(
         z_E,
         origin="lower",
@@ -172,6 +188,18 @@ def _plot_heatmap_maps(
     ax1.set_xlabel("perturbation level p")
     ax1.set_title("σ_max (edge)")
     fig.colorbar(m1, ax=ax1, label="σ_max", fraction=0.046)
+
+    m2 = ax2.imshow(
+        z_M,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        cmap="cividis",
+        interpolation="nearest",
+    )
+    ax2.set_xlabel("perturbation level p")
+    ax2.set_title("Σ(L·w) mass proxy")
+    fig.colorbar(m2, ax=ax2, label="Σ(L·w)", fraction=0.046)
     fig.suptitle("2D map: sorted response bands vs p", fontsize=10, y=1.02)
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -184,33 +212,49 @@ def _plot_hexbin_phase(
     out_png: Path,
     title: str,
 ) -> None:
-    """2D density: hexbin of (p, E_eff) and (p, σ_max) as side-by-side panels."""
+    """2D density: hexbin of (p, E_eff), (p, σ_max), (p, mass), (mass, E_eff)."""
     import matplotlib.pyplot as plt
 
     p_arr: list[float] = []
     e_arr: list[float] = []
     s_arr: list[float] = []
+    m_arr: list[float] = []
     for row in rows:
         if not row.get("ok"):
             continue
         p_arr.append(float(row["perturb"]))
         e_arr.append(float(row["E_eff"]))
         s_arr.append(float(row["sigma_max"]))
+        m_arr.append(float(row["strut_mass_metric"]))
     if len(p_arr) < 5:
         return
 
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 4.5))
-    hb0 = ax0.hexbin(p_arr, e_arr, gridsize=24, cmap="Blues", mincnt=1)
-    ax0.set_xlabel("perturbation p")
-    ax0.set_ylabel("E_eff")
-    ax0.set_title("count density (p, E_eff)")
-    fig.colorbar(hb0, ax=ax0, label="count")
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    ax00, ax01, ax10, ax11 = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
+    hb0 = ax00.hexbin(p_arr, e_arr, gridsize=22, cmap="Blues", mincnt=1)
+    ax00.set_xlabel("perturbation p")
+    ax00.set_ylabel("E_eff (homogenized)")
+    ax00.set_title("(p, E_eff)")
+    fig.colorbar(hb0, ax=ax00, label="count")
 
-    hb1 = ax1.hexbin(p_arr, s_arr, gridsize=24, cmap="Oranges", mincnt=1)
-    ax1.set_xlabel("perturbation p")
-    ax1.set_ylabel("σ_max")
-    ax1.set_title("count density (p, σ_max)")
-    fig.colorbar(hb1, ax=ax1, label="count")
+    hb1 = ax01.hexbin(p_arr, s_arr, gridsize=22, cmap="Oranges", mincnt=1)
+    ax01.set_xlabel("perturbation p")
+    ax01.set_ylabel("σ_max")
+    ax01.set_title("(p, σ_max)")
+    fig.colorbar(hb1, ax=ax01, label="count")
+
+    hb2 = ax10.hexbin(p_arr, m_arr, gridsize=22, cmap="Greens", mincnt=1)
+    ax10.set_xlabel("perturbation p")
+    ax10.set_ylabel("Σ(L·w) mass proxy")
+    ax10.set_title("(p, strut mass proxy)")
+    fig.colorbar(hb2, ax=ax10, label="count")
+
+    hb3 = ax11.hexbin(m_arr, e_arr, gridsize=22, cmap="Purples", mincnt=1)
+    ax11.set_xlabel("Σ(L·w) mass proxy")
+    ax11.set_ylabel("E_eff")
+    ax11.set_title("(mass proxy, E_eff)")
+    fig.colorbar(hb3, ax=ax11, label="count")
+
     fig.suptitle(title, fontsize=10)
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -230,17 +274,31 @@ def _plot_summary(
     Es = np.array([stats[float(p)]["E_std"] for p in levels])
     Sm = np.array([stats[float(p)]["sigma_mean"] for p in levels])
     Ss = np.array([stats[float(p)]["sigma_std"] for p in levels])
+    Mm = np.array([stats[float(p)]["mass_mean"] for p in levels])
+    Ms = np.array([stats[float(p)]["mass_std"] for p in levels])
+    Rom = np.array([stats[float(p)]["E_over_mass_mean"] for p in levels])
+    Ros = np.array([stats[float(p)]["E_over_mass_std"] for p in levels])
 
-    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(8, 11), sharex=True)
+    ax0, ax1, ax2, ax3 = axes
     ax0.errorbar(levels, Em, yerr=Es, fmt="o-", capsize=3, markersize=5)
     ax0.set_ylabel("E_eff (homogenized)")
     ax0.set_title(title)
     ax0.grid(True, alpha=0.3)
 
     ax1.errorbar(levels, Sm, yerr=Ss, fmt="s-", capsize=3, color="darkorange", markersize=5)
-    ax1.set_xlabel("perturbation level p")
-    ax1.set_ylabel("σ_max (edge, scaled units)")
+    ax1.set_ylabel("σ_max (edge, scaled)")
     ax1.grid(True, alpha=0.3)
+
+    ax2.errorbar(levels, Mm, yerr=Ms, fmt="^-", capsize=3, color="seagreen", markersize=5)
+    ax2.set_ylabel("Σ(L·w) mass proxy")
+    ax2.grid(True, alpha=0.3)
+
+    ax3.errorbar(levels, Rom, yerr=Ros, fmt="D-", capsize=3, color="purple", markersize=4)
+    ax3.set_xlabel("perturbation level p")
+    ax3.set_ylabel("E_eff / Σ(L·w)\n(stiffness per mass proxy)")
+    ax3.grid(True, alpha=0.3)
+
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=150)
@@ -308,7 +366,7 @@ def main() -> None:
     if not args.no_2d_maps:
         extra = (
             "figures: ensemble_Eeff_sigma.png  ensemble_map_2d_Eeff_sigma.png  "
-            "ensemble_hexbin_phase.png\n"
+            "ensemble_hexbin_phase.png  (heatmaps: E_eff, σ_max, mass; hexbins include p–mass and mass–E_eff)\n"
         )
     readme.write_text(
         f"kind={args.kind}  levels={args.levels}  p_max={args.p_max}  repeats={args.repeats}\n"
@@ -331,8 +389,9 @@ def main() -> None:
     if not args.no_2d_maps:
         z_E = _matrix_sorted_by_column(rows, levels, int(args.repeats), "E_eff")
         z_S = _matrix_sorted_by_column(rows, levels, int(args.repeats), "sigma_max")
+        z_M = _matrix_sorted_by_column(rows, levels, int(args.repeats), "strut_mass_metric")
         map_path = out_dir / "ensemble_map_2d_Eeff_sigma.png"
-        _plot_heatmap_maps(levels, z_E, z_S, map_path, title)
+        _plot_heatmap_maps(levels, z_E, z_S, z_M, map_path, title)
         hex_path = out_dir / "ensemble_hexbin_phase.png"
         _plot_hexbin_phase(rows, hex_path, f"{args.kind} — density in (p, response) space")
         print(f"Wrote {map_path}")

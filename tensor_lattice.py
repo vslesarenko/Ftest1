@@ -104,6 +104,8 @@ class MechanicsResult:
     n_nodes_reduced: int = 0
     n_edges_reduced: int = 0
     min_node_distance: float = float("nan")
+    strut_mass_metric: float = float("nan")
+    strut_length_sum: float = float("nan")
 
 
 @dataclass
@@ -626,6 +628,30 @@ def reduce_to_reachable_component(
     return xy_n, edges_f, weights_f, left_n, right_n
 
 
+def strut_mass_and_length_sums(
+    xy: np.ndarray,
+    edges: list[tuple[int, int]],
+    weights: list[float],
+) -> tuple[float, float]:
+    """
+    Geometric strut totals on the reduced beam network.
+
+    Returns (mass_metric, length_sum) where mass_metric = Σ_e L_e · w_e with L_e the
+    deformed Euclidean length and w_e the bond weight (stiffness fraction). With
+    unit reference density, this matches Σ (ρ A_ref w_e) L_e — a volume/mass proxy
+    when cross-section area scales like w_e (same scaling as EA in the model).
+    length_sum = Σ_e L_e ignores thickness weights.
+    """
+    mass_m = 0.0
+    len_sum = 0.0
+    for (i, j), wg in zip(edges, weights):
+        L = float(np.linalg.norm(xy[j] - xy[i]))
+        w = float(wg)
+        len_sum += L
+        mass_m += L * w
+    return float(mass_m), float(len_sum)
+
+
 def assemble_and_solve_weighted(
     xy: np.ndarray,
     edges: list[tuple[int, int]],
@@ -949,6 +975,7 @@ def solve_tensor_mechanics(
         xy_r, edges_r, weights_r, left, right = reduce_to_reachable_component(
             xy, edges, weights, w, h
         )
+        mass_m, len_sum = strut_mass_and_length_sums(xy_r, edges_r, weights_r)
 
         E_use = float(cfg.E) * float(cfg.e_scale)
         ea = E_use * cfg.A
@@ -995,6 +1022,8 @@ def solve_tensor_mechanics(
             n_nodes_reduced=int(xy_r.shape[0]),
             n_edges_reduced=len(edges_r),
             min_node_distance=gl.min_node_distance,
+            strut_mass_metric=mass_m,
+            strut_length_sum=len_sum,
         )
         return MechanicsSolve(
             result=mr,
@@ -1111,6 +1140,9 @@ def cmd_solve(args: argparse.Namespace) -> None:
     print(
         f"Reduced model: {r.n_nodes_reduced} nodes, {r.n_edges_reduced} edges "
         f"(reachable from left)"
+    )
+    print(
+        f"struts: ΣL={r.strut_length_sum:.6g}  Σ(L·w) mass proxy={r.strut_mass_metric:.6g}"
     )
     E_use = float(args.E) * float(args.e_scale)
     print(f"max stress est: {r.sigma_max:.6g} (same units as E)")
