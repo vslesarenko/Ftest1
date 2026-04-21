@@ -13,14 +13,15 @@ Channels (shape (4, H, W), index order [channel, row j, col i]):
   ch1  dy  — y shift from ideal, clipped to [-DY_MAX, DY_MAX] **except on those
        same face columns, where dy=0** so face nodes sit at y = j·STEP.
 
-  ch2  (horizontal half-edge) — stiffness weight in [0, 1] for the **beam from
-       node (i, j) to node (i+1, j)**. Stored at grid cell (j, i) for
-       i = 0..W-2; column i = W-1 has no “right” partner (zeroed).
+  ch2  (horizontal half-edge) — **relative thickness / stiffness** factor for the
+       **beam from node (i, j) to node (i+1, j)**. Often clipped to [0, 1] by
+       ``clip_tensor_inplace``; thickness sweeps may keep factors in e.g. [0.7, 1.3].
+       Stored at grid cell (j, i) for i = 0..W-2; column i = W-1 has no “right”
+       partner (zeroed).
 
-  ch3  (vertical half-edge) — stiffness weight for the **beam from node (i, j)
-       to node (i, j+1)** (one step in **+j**, i.e. increasing y / “up” on the
-       plot with origin=lower). Stored at (j, i) for j = 0..H-2; row j = H-1
-       is zeroed.
+  ch3  (vertical half-edge) — same for **beam from node (i, j) to node (i, j+1)**
+       (one step in **+j**, i.e. increasing y / “up” on the plot with origin=lower).
+       Stored at (j, i) for j = 0..H-2; row j = H-1 is zeroed.
 
   Each undirected grid edge appears **once** (east or north from the lower-left
   endpoint), which avoids double-counting in CNN channels.
@@ -117,6 +118,7 @@ class MechanicsSolve:
     sigma: np.ndarray | None = None
     xy: np.ndarray | None = None
     edges: list[tuple[int, int]] | None = None
+    edge_weights: list[float] | None = None
     connect_bridge: tuple[int, int] | None = None
 
 
@@ -219,6 +221,38 @@ def clip_tensor_inplace(t: np.ndarray) -> None:
     t[CH_DX, :, w - 1] = 0.0
     t[CH_DY, :, 0] = 0.0
     t[CH_DY, :, w - 1] = 0.0
+
+
+def clip_displacements_only_inplace(t: np.ndarray) -> None:
+    """Clip only dx, dy (faces fixed); leave bond channels unchanged."""
+    _, h, w = t.shape
+    t[CH_DX] = np.clip(t[CH_DX], -DX_MAX, DX_MAX)
+    t[CH_DY] = np.clip(t[CH_DY], -DY_MAX, DY_MAX)
+    t[CH_DX, :, 0] = 0.0
+    t[CH_DX, :, w - 1] = 0.0
+    t[CH_DY, :, 0] = 0.0
+    t[CH_DY, :, w - 1] = 0.0
+
+
+def apply_independent_thickness_inplace(
+    t: np.ndarray,
+    seed: int,
+    *,
+    low: float = 0.7,
+    high: float = 1.3,
+    bond_max: float = 1.35,
+) -> None:
+    """
+    Multiply each positive half-edge weight by an independent U(low, high) factor
+    (default relative thickness/stiffness), then clip bonds to ``bond_max``.
+    """
+    rng = np.random.default_rng(seed)
+    lo = float(min(low, high))
+    hi = float(max(low, high))
+    bmx = float(max(bond_max, hi))
+    for ch in (CH_RIGHT, CH_TOP):
+        fac = rng.uniform(lo, hi, size=t[ch].shape)
+        t[ch] = np.where(t[ch] > 0, np.clip(t[ch] * fac, 0.0, bmx), 0.0)
 
 
 def mask_bonds_by_threshold_inplace(t: np.ndarray, tau: float) -> None:
@@ -346,10 +380,15 @@ def tensor_to_geometry(
     w: int | None = None,
     h: int | None = None,
     bond_threshold: float = 0.5,
+    clip_bonds: bool = True,
 ) -> tuple[np.ndarray, list[tuple[int, int]], list[float]]:
     """
     Build node coordinates and edges. Edge list order: all horiz (i,j)→(i+1,j)
     then vert (i,j)→(i,j+1). Weights are bond values (> threshold kept).
+
+    If ``clip_bonds`` is False, only displacements are clipped (same as
+    ``clip_displacements_only_inplace``); bond channels are left as-is so
+    thickness factors above 1 remain for visualization / weighted solves.
     """
     if t.ndim != 3 or t.shape[0] != N_CH:
         raise ValueError(f"Expected tensor ({N_CH}, H, W), got {t.shape}")
@@ -359,7 +398,10 @@ def tensor_to_geometry(
     if w0 != w or h0 != h:
         raise ValueError("Shape mismatch")
 
-    clip_tensor_inplace(t)
+    if clip_bonds:
+        clip_tensor_inplace(t)
+    else:
+        clip_displacements_only_inplace(t)
 
     xy = np.zeros((w * h, 2), dtype=np.float64)
     for j in range(h):
@@ -835,6 +877,21 @@ def effective_young_modulus_homogenized(
     }
 
 
+def _half_edge_thickness_range(t: np.ndarray, w: int, h: int) -> tuple[float, float]:
+    """Min/max stiffness over active half-edges (structural zeros at borders excluded from min)."""
+    hr = t[CH_RIGHT][:, : w - 1]
+    vt = t[CH_TOP][: h - 1, :]
+    vals = np.concatenate([hr.ravel(), vt.ravel()])
+    pos = vals[vals > 0]
+    if pos.size == 0:
+        return 0.0, 1.0
+    lo, hi = float(pos.min()), float(pos.max())
+    if hi - lo < 1e-12:
+        lo -= 0.05
+        hi += 0.05
+    return lo, hi
+
+
 def visualize_tensor(
     t: np.ndarray,
     out_path: Path | None,
@@ -846,35 +903,53 @@ def visualize_tensor(
 ) -> None:
     try:
         import matplotlib.pyplot as plt
-        from matplotlib.colors import Normalize
     except ImportError:
         return
     _, h, w = t.shape
-    clip_tensor_inplace(t)
-    xy, edges, _ = tensor_to_geometry(t, w=w, h=h)
+    # Copy so we do not clip bond/thickness channels in the caller's tensor; ch2/ch3
+    # show actual relative thickness factors (may exceed 1).
+    t_vis = np.asarray(t, dtype=np.float64, copy=True)
+    xy, edges, _ = tensor_to_geometry(t_vis, w=w, h=h, clip_bonds=False)
+    bmin, bmax = _half_edge_thickness_range(t_vis, w, h)
 
     fig = plt.figure(figsize=(12, 8))
     gs = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.15])
 
     extent = [-0.5, w - 0.5, -0.5, h - 0.5]
     ax0 = fig.add_subplot(gs[0, 0])
-    im0 = ax0.imshow(t[CH_DX], origin="lower", cmap="coolwarm", extent=extent, aspect="auto")
+    im0 = ax0.imshow(t_vis[CH_DX], origin="lower", cmap="coolwarm", extent=extent, aspect="auto")
     ax0.set_title("ch0: dx")
     fig.colorbar(im0, ax=ax0, fraction=0.046)
 
     ax1 = fig.add_subplot(gs[0, 1])
-    im1 = ax1.imshow(t[CH_DY], origin="lower", cmap="coolwarm", extent=extent, aspect="auto")
+    im1 = ax1.imshow(t_vis[CH_DY], origin="lower", cmap="coolwarm", extent=extent, aspect="auto")
     ax1.set_title("ch1: dy")
     fig.colorbar(im1, ax=ax1, fraction=0.046)
 
     ax2 = fig.add_subplot(gs[0, 2])
-    im2 = ax2.imshow(t[CH_RIGHT], origin="lower", cmap="magma", vmin=0, vmax=1, extent=extent, aspect="auto")
-    ax2.set_title("ch2: →(i+1,j) horiz. bond weight")
+    im2 = ax2.imshow(
+        t_vis[CH_RIGHT],
+        origin="lower",
+        cmap="magma",
+        vmin=bmin,
+        vmax=bmax,
+        extent=extent,
+        aspect="auto",
+    )
+    ax2.set_title("ch2: →(i+1,j) horiz. thickness factor")
     fig.colorbar(im2, ax=ax2, fraction=0.046)
 
     ax3 = fig.add_subplot(gs[1, 0])
-    im3 = ax3.imshow(t[CH_TOP], origin="lower", cmap="magma", vmin=0, vmax=1, extent=extent, aspect="auto")
-    ax3.set_title("ch3: →(i,j+1) vert. bond (+y) weight")
+    im3 = ax3.imshow(
+        t_vis[CH_TOP],
+        origin="lower",
+        cmap="magma",
+        vmin=bmin,
+        vmax=bmax,
+        extent=extent,
+        aspect="auto",
+    )
+    ax3.set_title("ch3: →(i,j+1) vert. thickness factor (+y)")
     fig.colorbar(im3, ax=ax3, fraction=0.046)
 
     ax4 = fig.add_subplot(gs[1, 1:])
@@ -1022,7 +1097,10 @@ def solve_tensor_mechanics(
     bridge: tuple[int, int] | None = None
 
     try:
-        clip_tensor_inplace(t)
+        # Displacements must stay in range; bond channels are **not** clipped to [0,1]
+        # here so relative thickness factors > 1 (stiffer than nominal) scale EA, EI
+        # correctly — same material, stiffness ∝ thickness proxy in ch2/ch3.
+        clip_displacements_only_inplace(t)
         mask_bonds_by_threshold_inplace(t, float(cfg.bond_threshold))
 
         if cfg.connect_all:
@@ -1033,7 +1111,9 @@ def solve_tensor_mechanics(
             ub = float(np.clip(cfg.uniform_bond_value, 0.0, 1.0))
             uniform_bond_weights_inplace(t, ub)
 
-        xy, edges, weights = tensor_to_geometry(t, w=w, h=h, bond_threshold=1e-12)
+        xy, edges, weights = tensor_to_geometry(
+            t, w=w, h=h, bond_threshold=1e-12, clip_bonds=False
+        )
         if len(edges) < 3:
             return MechanicsSolve(
                 result=MechanicsResult(ok=False, error="Too few edges to form a frame."),
@@ -1108,6 +1188,7 @@ def solve_tensor_mechanics(
             sigma=sigma,
             xy=xy_r,
             edges=edges_r,
+            edge_weights=list(weights_r),
             connect_bridge=bridge,
         )
     except (ValueError, np.linalg.LinAlgError) as e:
